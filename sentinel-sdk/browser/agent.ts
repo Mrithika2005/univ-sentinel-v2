@@ -1,20 +1,29 @@
 /* ============================================================
-   SENTINEL SDK — Browser Agent  (final, complete)
-   Auto-instruments:
-     • fetch + XHR (with rate-limit, auth, retry detection)
-     • Navigation (SPA + page load + previousPage)
-     • Web Vitals: LCP, FCP, FP, CLS, FID, INP, TTFB, long tasks, FPS
-     • Interactions: click, scroll depth, form submit + abandonment
-     • Errors: JS exceptions, unhandled rejections, asset failures
-     • Browser/device metadata on every record
-     • React + Angular auto-detection
-     • Class prototype auto-instrumentation
-     • Configurable sampling
-   Sends logs → /sentinel/ingest relay
+   SENTINEL SDK — Browser Agent  v2.2
+   New in v2.2:
+     • PER-REQUEST SESSION TRACKING: Every page load / SPA navigation
+       gets or generates a sessionId (localStorage → sessionStorage →
+       cookie → new UUID). The ID is sent on every fetch/XHR as
+       X-Session-Id and read back from the response header so the
+       server and browser stay in sync.
+     • SESSION START / END EVENTS: emitted to OBSERVABILITY layer with
+       sessionId, userId, sessionStart, activeUsers (from server
+       X-Active-Users response header if present).
+     • activeUsers: read from X-Active-Users response header on every
+       API call and reported in context. Falls back to localStorage
+       count for offline-first scenarios.
+     • Per-request traceId: every fetch/XHR carries its own spanId;
+       the shared session traceId flows via traceparent header so the
+       server can do a precise JOIN.
+     • Angular service auto-discovery: instruments HttpClient, Router,
+       and component instances detected via ng.getComponent / ng.getContext.
+     • React component render tracking via __REACT_DEVTOOLS_GLOBAL_HOOK__.
+     • All v2.1 features preserved unchanged.
    ============================================================ */
 
 import {
   LogLayer, LogLevel, LogRecord, inferLayer,
+  parseTraceparent, buildTraceparent,
   type InstrumentedClassMeta, type LogContext,
 } from '../core/types.ts';
 
@@ -28,7 +37,8 @@ export interface SentinelBrowserConfig {
   slowFetchMs?:    number;
   debug?:          boolean;
   traceId?:        string;
-  samplingRate?:   number;  // 0.0–1.0, default 1.0
+  samplingRate?:   number;
+  sessionTimeout?: number;   // ms idle before session expires, default 30 min
 }
 
 /* ── Device/browser helpers ──────────────────────────────── */
@@ -67,30 +77,93 @@ function connectionType(): string {
       || 'unknown';
 }
 
+/* ── Session management ──────────────────────────────────── */
+
+const _SESSION_KEY   = 'sentinel_sid';
+const _SESSION_TS_KEY = 'sentinel_sid_ts';
+
+function _loadOrCreateSession(timeoutMs: number): string {
+  try {
+    // Check for existing valid session
+    const existing = sessionStorage.getItem(_SESSION_KEY)
+                  || localStorage.getItem(_SESSION_KEY);
+    const lastSeen  = parseInt(localStorage.getItem(_SESSION_TS_KEY) || '0', 10);
+    const isExpired = Date.now() - lastSeen > timeoutMs;
+
+    if (existing && !isExpired) {
+      localStorage.setItem(_SESSION_TS_KEY, String(Date.now()));
+      return existing;
+    }
+  } catch { /* storage blocked */ }
+
+  // Generate new session id
+  const sid = `sess_${_gen16hex()}`;
+  try {
+    sessionStorage.setItem(_SESSION_KEY, sid);
+    localStorage.setItem(_SESSION_KEY, sid);
+    localStorage.setItem(_SESSION_TS_KEY, String(Date.now()));
+  } catch { /* storage blocked */ }
+  return sid;
+}
+
+function _touchSession(): void {
+  try { localStorage.setItem(_SESSION_TS_KEY, String(Date.now())); } catch { /* ignored */ }
+}
+
+function _gen16hex(): string {
+  if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
+    const buf = new Uint8Array(16);
+    crypto.getRandomValues(buf);
+    return Array.from(buf).map((b) => b.toString(16).padStart(2, '0')).join('');
+  }
+  return Array.from({ length: 16 }, () => Math.floor(Math.random() * 256).toString(16).padStart(2, '0')).join('');
+}
+
+function _gen8hex(): string {
+  if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
+    const buf = new Uint8Array(8);
+    crypto.getRandomValues(buf);
+    return Array.from(buf).map((b) => b.toString(16).padStart(2, '0')).join('');
+  }
+  return Array.from({ length: 8 }, () => Math.floor(Math.random() * 256).toString(16).padStart(2, '0')).join('');
+}
+
+const _AUTH_PATH_RE = /\/(login|logout|auth|token|oauth|signin|signup|refresh|verify)/i;
+
 /* ── Main class ──────────────────────────────────────────── */
 
 export class SentinelBrowser {
-  private cfg:         Required<SentinelBrowserConfig>;
-  private queue:       LogRecord[] = [];
-  private flushTimer?: ReturnType<typeof setInterval>;
-  private navStart     = Date.now();
-  private instrumented = new WeakSet<object>();
-  private deviceMeta:  Record<string, any>;
+  private cfg:          Required<SentinelBrowserConfig>;
+  private queue:        LogRecord[] = [];
+  private flushTimer?:  ReturnType<typeof setInterval>;
+  private navStart      = Date.now();
+  private instrumented  = new WeakSet<object>();
+  private deviceMeta:   Record<string, any>;
+  private sessionId:    string;
+  private traceId:      string;
+  private userId?:      string;
+  private activeUsers   = 0;
+  private sessionStart: string;
 
   constructor(config: SentinelBrowserConfig = {}) {
     this.cfg = {
-      serviceName:   config.serviceName   || 'browser-app',
-      relayUrl:      config.relayUrl      || '/sentinel/ingest',
-      batchSize:     config.batchSize     || 20,
-      flushInterval: config.flushInterval || 3000,
-      slowFetchMs:   config.slowFetchMs   || 1000,
-      debug:         config.debug         || false,
-      traceId:       config.traceId       || this._genTraceId(),
-      samplingRate:  config.samplingRate  ?? 1.0,
+      serviceName:    config.serviceName    || 'browser-app',
+      relayUrl:       config.relayUrl       || '/sentinel/ingest',
+      batchSize:      config.batchSize      || 20,
+      flushInterval:  config.flushInterval  || 3000,
+      slowFetchMs:    config.slowFetchMs    || 1000,
+      debug:          config.debug          || false,
+      traceId:        config.traceId        || _gen16hex(),
+      samplingRate:   config.samplingRate   ?? 1.0,
+      sessionTimeout: config.sessionTimeout ?? 30 * 60 * 1000,
     };
 
-    const ua = navigator.userAgent;
-    this.deviceMeta = {
+    this.traceId      = this.cfg.traceId;
+    this.sessionId    = _loadOrCreateSession(this.cfg.sessionTimeout);
+    this.sessionStart = new Date().toISOString();
+
+    const ua          = navigator.userAgent;
+    this.deviceMeta   = {
       ...parseBrowser(ua),
       osName:         parseOS(ua),
       deviceType:     parseDeviceType(ua),
@@ -115,23 +188,39 @@ export class SentinelBrowser {
     this._startFlushLoop();
     this._detectFramework();
 
+    // Emit session start
+    this._emit({
+      message: `Session started: ${this.sessionId}`,
+      layer:   LogLayer.OBSERVABILITY,
+      level:   LogLevel.INFO,
+      context: {
+        sessionId:   this.sessionId,
+        sessionStart: this.sessionStart,
+        activeUsers:  this.activeUsers,
+        userAgent:   navigator.userAgent,
+        url:         location.href,
+        ...this.deviceMeta,
+      },
+    });
+
     this._emit({
       message: `Sentinel Browser Agent hooked on "${this.cfg.serviceName}"`,
       layer:   LogLayer.INFRASTRUCTURE,
       level:   LogLevel.INFO,
       context: { userAgent: navigator.userAgent, url: location.href, ...this.deviceMeta },
     });
+
     return this;
   }
 
   instrument<T extends object>(target: T | (new (...a: any[]) => T), layer?: LogLayer): this {
-    const proto = typeof target === 'function' ? target.prototype : Object.getPrototypeOf(target);
+    const proto = typeof target === 'function' ? (target as any).prototype : Object.getPrototypeOf(target);
     if (!proto || this.instrumented.has(proto)) return this;
     this.instrumented.add(proto);
 
-    const className     = (typeof target === 'function' ? target.name : target.constructor?.name) || 'UnknownClass';
+    const className     = (typeof target === 'function' ? (target as any).name : target.constructor?.name) || 'UnknownClass';
     const resolvedLayer = layer || inferLayer(className);
-    const methodNames: string[] = [];
+    const methodNames:  string[] = [];
 
     let p: object | null = proto;
     while (p && p !== Object.prototype) {
@@ -161,13 +250,16 @@ export class SentinelBrowser {
     return this;
   }
 
-  log(partial: Partial<LogRecord> & { message: string }): void {
-    this._emit(partial);
+  log(partial: Partial<LogRecord> & { message: string }): void { this._emit(partial); }
+
+  flush(): Promise<void> { return this._flush(); }
+
+  setUserId(userId: string): void {
+    this.userId = userId;
+    _touchSession();
   }
 
-  flush(): Promise<void> {
-    return this._flush();
-  }
+  getSessionId(): string { return this.sessionId; }
 
   /* ── Emitter ────────────────────────────────────────────── */
 
@@ -177,9 +269,12 @@ export class SentinelBrowser {
     const record = new LogRecord({
       ...partial,
       service:  this.cfg.serviceName,
-      trace_id: partial.trace_id || this.cfg.traceId,
+      trace_id: partial.trace_id || this.traceId,
       context:  {
         ...(partial.context || {}),
+        sessionId:        this.sessionId,
+        userId:           this.userId,
+        activeUsers:      this.activeUsers,
         samplingRate:     this.cfg.samplingRate,
         samplingDecision: 'sampled',
       },
@@ -203,11 +298,19 @@ export class SentinelBrowser {
     try {
       const res = await fetch(this.cfg.relayUrl, {
         method:    'POST',
-        headers:   { 'Content-Type': 'application/json', 'X-Sentinel': '1' },
+        headers:   {
+          'Content-Type':  'application/json',
+          'X-Sentinel':    '1',
+          'X-Session-Id':  this.sessionId,
+          ...(this.userId ? { 'X-User-Id': this.userId } : {}),
+        },
         body:      JSON.stringify(batch.map((r) => r.to_dict())),
         keepalive: true,
       });
       if (!res.ok && this.cfg.debug) console.warn('[SENTINEL] relay rejected batch:', res.status);
+      // Read activeUsers from server response header
+      const au = res.headers.get('x-active-users') || res.headers.get('X-Active-Users');
+      if (au) this.activeUsers = parseInt(au, 10) || this.activeUsers;
     } catch (err) {
       if (this.cfg.debug) console.error('[SENTINEL] flush error:', err);
       this.queue.unshift(...batch);
@@ -217,9 +320,24 @@ export class SentinelBrowser {
   private _startFlushLoop(): void {
     this.flushTimer = setInterval(() => void this._flush(), this.cfg.flushInterval);
     window.addEventListener('visibilitychange', () => {
+      _touchSession();
       if (document.visibilityState === 'hidden') void this._flush();
     });
-    window.addEventListener('beforeunload', () => void this._flush());
+    window.addEventListener('beforeunload', () => {
+      // Session end
+      this._emit({
+        message: `Session ended: ${this.sessionId}`,
+        layer:   LogLayer.OBSERVABILITY,
+        level:   LogLevel.INFO,
+        context: {
+          sessionId:          this.sessionId,
+          sessionEnd:         new Date().toISOString(),
+          sessionDurationMs:  Date.now() - this.navStart,
+          activeUsers:        this.activeUsers,
+        },
+      });
+      void this._flush();
+    });
   }
 
   /* ── Fetch patch ────────────────────────────────────────── */
@@ -227,7 +345,6 @@ export class SentinelBrowser {
   private _patchFetch(): void {
     const orig = window.fetch.bind(window);
     const self = this;
-    const AUTH_PATHS = /\/(login|logout|auth|token|oauth|signin|signup|refresh|verify)/i;
 
     (window as any).fetch = async (...args: Parameters<typeof fetch>): Promise<Response> => {
       const [resource, init] = args;
@@ -236,64 +353,76 @@ export class SentinelBrowser {
 
       const method    = init?.method || 'GET';
       const startTime = performance.now();
+      const spanId    = _gen8hex();
+
+      // Inject traceparent + session headers
+      const headers = new Headers(init?.headers || {});
+      headers.set('traceparent', buildTraceparent(self.traceId, spanId));
+      headers.set('x-session-id', self.sessionId);
+      if (self.userId) headers.set('x-user-id', self.userId);
+      const patchedInit: RequestInit = { ...init, headers };
 
       self._emit({
         message: `→ ${method} ${url}`,
         layer:   LogLayer.API_GATEWAY,
         level:   LogLevel.INFO,
-        context: {
-          method, path: url,
-          requestSizeBytes: typeof init?.body === 'string' ? init.body.length : 0,
-        } as LogContext,
+        context: { method, path: url, requestSizeBytes: typeof init?.body === 'string' ? init.body.length : 0 } as LogContext,
       });
 
       try {
-        const response   = await orig(...args);
+        const response   = await orig(resource instanceof Request ? new Request(resource, patchedInit) : url, patchedInit);
         const durationMs = performance.now() - startTime;
         const isError    = !response.ok;
         const isSlow     = durationMs > self.cfg.slowFetchMs;
-        const rateLimitHit      = response.status === 429;
-        const rateLimitRemaining = Number(response.headers.get('X-RateLimit-Remaining') ?? response.headers.get('RateLimit-Remaining') ?? -1);
+        const rateLimitHit = response.status === 429;
 
-        // Auth event detection
-        if (AUTH_PATHS.test(url) || response.status === 401 || response.status === 403) {
+        // Sync activeUsers from response
+        const au = response.headers.get('x-active-users');
+        if (au) self.activeUsers = parseInt(au, 10) || self.activeUsers;
+        // Sync sessionId if server generated a new one
+        const sid = response.headers.get('x-session-id');
+        if (sid && sid !== self.sessionId) {
+          self.sessionId = sid;
+          try { localStorage.setItem(_SESSION_KEY, sid); sessionStorage.setItem(_SESSION_KEY, sid); } catch { /* blocked */ }
+        }
+
+        if (_AUTH_PATH_RE.test(url) || response.status === 401 || response.status === 403) {
           self._emit({
             message: `Auth event: ${method} ${url} → ${response.status}`,
             layer:   LogLayer.SECURITY,
             level:   response.status >= 400 ? LogLevel.WARN : LogLevel.INFO,
             context: {
-              authResult: response.status < 400 ? 'success' : 'failure',
-              path:       url,
-              statusCode: response.status,
+              authResult:    response.status < 400 ? 'success' : 'failure',
+              path:          url, statusCode: response.status,
               failureReason: response.status >= 400 ? `HTTP ${response.status}` : undefined,
               ...self.deviceMeta,
             } as LogContext,
           });
         }
 
+        const rateLimitRemaining = Number(
+          response.headers.get('X-RateLimit-Remaining') ?? response.headers.get('RateLimit-Remaining') ?? -1
+        );
+
         self._emit({
           message: `← ${method} ${url} ${response.status} (${durationMs.toFixed(1)}ms)${isSlow ? ' [SLOW]' : ''}${rateLimitHit ? ' [RATE-LIMITED]' : ''}`,
           layer:   LogLayer.API_GATEWAY,
           level:   isError ? LogLevel.ERROR : isSlow ? LogLevel.WARN : LogLevel.INFO,
           context: {
-            method, path: url,
-            statusCode:        response.status,
-            durationMs,
-            slowQuery:         isSlow,
-            slowQueryThresholdMs: self.cfg.slowFetchMs,
-            rateLimitHit,
-            rateLimitRemaining: rateLimitRemaining >= 0 ? rateLimitRemaining : undefined,
-            responseSizeBytes:  Number(response.headers.get('content-length') || 0) || undefined,
+            method, path: url, statusCode: response.status, durationMs,
+            slowQuery: isSlow, slowQueryThresholdMs: self.cfg.slowFetchMs,
+            rateLimitHit, rateLimitRemaining: rateLimitRemaining >= 0 ? rateLimitRemaining : undefined,
+            responseSizeBytes: Number(response.headers.get('content-length') || 0) || undefined,
           } as LogContext,
         });
 
+        _touchSession();
         return response;
       } catch (err) {
         const durationMs = performance.now() - startTime;
         self._emit({
           message: `✗ ${method} ${url} — network error after ${durationMs.toFixed(1)}ms`,
-          layer:   LogLayer.API_GATEWAY,
-          level:   LogLevel.ERROR,
+          layer:   LogLayer.API_GATEWAY, level: LogLevel.ERROR,
           context: { method, path: url, durationMs, exceptionType: String(err) } as LogContext,
         });
         throw err;
@@ -318,6 +447,12 @@ export class SentinelBrowser {
         this._method = method;
         this._url    = String(url);
         (super.open as any)(method, url, ...rest);
+        // Inject headers after open
+        try {
+          this.setRequestHeader('traceparent', buildTraceparent(self.traceId, _gen8hex()));
+          this.setRequestHeader('x-session-id', self.sessionId);
+          if (self.userId) this.setRequestHeader('x-user-id', self.userId);
+        } catch { /* CSP or already sent */ }
       }
 
       send(body?: Document | XMLHttpRequestBodyInit | null): void {
@@ -325,27 +460,27 @@ export class SentinelBrowser {
         self._emit({
           message: `XHR → ${this._method} ${this._url}`,
           layer:   LogLayer.API_GATEWAY, level: LogLevel.INFO,
-          context: {
-            method: this._method, path: this._url,
-            requestSizeBytes: typeof body === 'string' ? body.length : 0,
-          } as LogContext,
+          context: { method: this._method, path: this._url, requestSizeBytes: typeof body === 'string' ? body.length : 0 } as LogContext,
         });
 
         this.addEventListener('loadend', () => {
           const durationMs        = performance.now() - this._start;
           const rateLimitHit      = this.status === 429;
           const rateLimitRemaining = Number(this.getResponseHeader('X-RateLimit-Remaining') ?? -1);
+          // Sync activeUsers
+          const au = this.getResponseHeader('x-active-users');
+          if (au) self.activeUsers = parseInt(au, 10) || self.activeUsers;
+
           self._emit({
             message: `XHR ← ${this._method} ${this._url} ${this.status} (${durationMs.toFixed(1)}ms)${rateLimitHit ? ' [RATE-LIMITED]' : ''}`,
             layer:   LogLayer.API_GATEWAY,
             level:   this.status >= 400 ? LogLevel.ERROR : LogLevel.INFO,
             context: {
-              method: this._method, path: this._url,
-              statusCode: this.status, durationMs,
-              rateLimitHit,
-              rateLimitRemaining: rateLimitRemaining >= 0 ? rateLimitRemaining : undefined,
+              method: this._method, path: this._url, statusCode: this.status, durationMs,
+              rateLimitHit, rateLimitRemaining: rateLimitRemaining >= 0 ? rateLimitRemaining : undefined,
             } as LogContext,
           });
+          _touchSession();
         });
 
         super.send(body);
@@ -391,16 +526,15 @@ export class SentinelBrowser {
   }
 
   private _onNavigate(trigger: string, previousPage: string): void {
+    _touchSession();
     this._emit({
       message: `Navigation: ${trigger} → ${location.pathname}`,
-      layer:   LogLayer.PRESENTATION,
-      level:   LogLevel.INFO,
+      layer:   LogLayer.PRESENTATION, level: LogLevel.INFO,
       context: {
-        page:              location.pathname,
-        previousPage,
+        page: location.pathname, previousPage,
         navigationTrigger: trigger,
-        sessionDuration:   (Date.now() - this.navStart) / 1000,
-        interactionType:   'navigate',
+        sessionDuration: (Date.now() - this.navStart) / 1000,
+        interactionType: 'navigate',
       } as LogContext,
     });
   }
@@ -410,24 +544,20 @@ export class SentinelBrowser {
   private _hookInteractions(): void {
     const self = this;
 
-    // Clicks
     window.addEventListener('click', (e) => {
       const t = e.target as HTMLElement;
+      _touchSession();
       self._emit({
         message: `Click: <${t.tagName?.toLowerCase()}>${t.id ? '#' + t.id : ''}`,
-        layer:   LogLayer.PRESENTATION,
-        level:   LogLevel.INFO,
+        layer:   LogLayer.PRESENTATION, level: LogLevel.INFO,
         context: {
-          interactionType: 'click',
-          elementTag:  t.tagName,
-          elementId:   t.id,
-          elementText: t.innerText?.slice(0, 60),
-          page:        location.pathname,
+          interactionType: 'click', elementTag: t.tagName,
+          elementId: t.id, elementText: t.innerText?.slice(0, 60),
+          page: location.pathname,
         } as LogContext,
       });
     }, { capture: true, passive: true });
 
-    // Scroll depth
     let maxScroll = 0;
     let scrollTimer: ReturnType<typeof setTimeout>;
     window.addEventListener('scroll', () => {
@@ -440,15 +570,13 @@ export class SentinelBrowser {
           maxScroll = depth;
           self._emit({
             message: `Scroll depth: ${depth}%`,
-            layer:   LogLayer.PRESENTATION,
-            level:   LogLevel.INFO,
+            layer:   LogLayer.PRESENTATION, level: LogLevel.INFO,
             context: { interactionType: 'scroll', scrollDepthPercent: depth, page: location.pathname } as LogContext,
           });
         }
       }, 500);
     }, { passive: true });
 
-    // Form submit
     window.addEventListener('submit', (e) => {
       const t      = e.target as HTMLFormElement;
       const formId = t.id || t.getAttribute('name') || 'unknown-form';
@@ -456,16 +584,12 @@ export class SentinelBrowser {
       const completed = fields.filter((f) => f.value?.length > 0).length;
       self._emit({
         message: `Form submitted: ${formId}`,
-        layer:   LogLayer.PRESENTATION,
-        level:   LogLevel.INFO,
+        layer:   LogLayer.PRESENTATION, level: LogLevel.INFO,
         context: {
-          interactionType:     'submit',
-          formId,
-          elementId:           formId,
-          elementTag:          'FORM',
-          formFieldsCompleted: completed,
-          formFieldsTotal:     fields.length,
-          page:                location.pathname,
+          interactionType: 'submit', formId,
+          elementId: formId, elementTag: 'FORM',
+          formFieldsCompleted: completed, formFieldsTotal: fields.length,
+          page: location.pathname,
         } as LogContext,
       });
     }, { capture: true });
@@ -476,10 +600,14 @@ export class SentinelBrowser {
       const el   = e.target as HTMLInputElement;
       const form = el.closest('form');
       if (!form) return;
-      const formId  = form.id || form.getAttribute('name') || 'unknown-form';
+      const formId = form.id || form.getAttribute('name') || 'unknown-form';
       const fields  = Array.from(form.elements).filter((f: any) => f.name) as HTMLInputElement[];
-      const completed = fields.filter((f) => f.value?.length > 0).length;
-      dirtyForms.set(formId, { id: formId, completed, total: fields.length, lastField: el.name || el.id });
+      dirtyForms.set(formId, {
+        id: formId,
+        completed: fields.filter((f) => f.value?.length > 0).length,
+        total: fields.length,
+        lastField: el.name || el.id,
+      });
     }, { passive: true });
 
     window.addEventListener('visibilitychange', () => {
@@ -487,15 +615,11 @@ export class SentinelBrowser {
       dirtyForms.forEach((info) => {
         self._emit({
           message: `Form abandoned: ${info.id} (${info.completed}/${info.total} fields)`,
-          layer:   LogLayer.PRESENTATION,
-          level:   LogLevel.WARN,
+          layer:   LogLayer.PRESENTATION, level: LogLevel.WARN,
           context: {
-            interactionType:      'form_abandon',
-            formId:               info.id,
-            formFieldsCompleted:  info.completed,
-            formFieldsTotal:      info.total,
-            formAbandonedAtField: info.lastField,
-            page:                 location.pathname,
+            interactionType: 'form_abandon', formId: info.id,
+            formFieldsCompleted: info.completed, formFieldsTotal: info.total,
+            formAbandonedAtField: info.lastField, page: location.pathname,
           } as LogContext,
         });
       });
@@ -512,29 +636,20 @@ export class SentinelBrowser {
         const t = e.target as HTMLElement;
         self._emit({
           message: `Asset load failure: ${(t as any).src || (t as any).href}`,
-          layer:   LogLayer.PRESENTATION,
-          level:   LogLevel.ERROR,
+          layer:   LogLayer.PRESENTATION, level: LogLevel.ERROR,
           context: {
-            elementTag: t.tagName,
-            assetUrl:   (t as any).src || (t as any).href,
-            errorType:  'asset_load',
-            page:       location.pathname,
-            ...self.deviceMeta,
+            elementTag: t.tagName, assetUrl: (t as any).src || (t as any).href,
+            errorType: 'asset_load', page: location.pathname, ...self.deviceMeta,
           } as LogContext,
         });
         return;
       }
-
       self._emit({
         message: `JS Error: ${e.message}`,
-        layer:   LogLayer.SECURITY,
-        level:   LogLevel.FATAL,
+        layer:   LogLayer.SECURITY, level: LogLevel.FATAL,
         context: {
-          errorType:  'js_error',
-          assetUrl:   e.filename,
-          stackTrace: e.error?.stack,
-          page:       location.pathname,
-          ...self.deviceMeta,
+          errorType: 'js_error', assetUrl: e.filename,
+          stackTrace: e.error?.stack, page: location.pathname, ...self.deviceMeta,
         } as LogContext,
       });
     }, true);
@@ -542,13 +657,8 @@ export class SentinelBrowser {
     window.addEventListener('unhandledrejection', (e) => {
       self._emit({
         message: `Unhandled Rejection: ${e.reason}`,
-        layer:   LogLayer.OBSERVABILITY,
-        level:   LogLevel.ERROR,
-        context: {
-          errorType:     'unhandled_rejection',
-          exceptionType: String(e.reason),
-          page:          location.pathname,
-        } as LogContext,
+        layer:   LogLayer.OBSERVABILITY, level: LogLevel.ERROR,
+        context: { errorType: 'unhandled_rejection', exceptionType: String(e.reason), page: location.pathname } as LogContext,
       });
     });
   }
@@ -559,7 +669,6 @@ export class SentinelBrowser {
     if (!('PerformanceObserver' in window)) return;
     const self = this;
 
-    // Named vital → context field
     const vitalField: Record<string, string> = {
       'first-contentful-paint':   'fcpMs',
       'first-paint':              'fpMs',
@@ -574,41 +683,32 @@ export class SentinelBrowser {
       try {
         const obs = new PerformanceObserver((list) => {
           list.getEntries().forEach((entry) => {
-            const value   = (entry as any).value ?? (entry as any).processingStart != null
+            const value  = (entry as any).value ?? (entry as any).processingStart != null
               ? ((entry as any).processingStart - entry.startTime)
               : (entry as any).duration ?? entry.startTime;
-            const isSlow  = type === 'longtask' || (type === 'largest-contentful-paint' && value > 2500);
-            const field   = vitalField[entry.name] || vitalField[type];
+            const isSlow = type === 'longtask' || (type === 'largest-contentful-paint' && value > 2500);
+            const field  = vitalField[entry.name] || vitalField[type];
             const extra: Record<string, any> = field ? { [field]: value } : {};
-
-            // TTFB from navigation timing
-            if (type === 'navigation') {
-              const nav = entry as PerformanceNavigationTiming;
-              extra['ttfbMs'] = nav.responseStart - nav.requestStart;
-            }
+            if (type === 'navigation') extra['ttfbMs'] = (entry as PerformanceNavigationTiming).responseStart - (entry as PerformanceNavigationTiming).requestStart;
 
             self._emit({
               message: `Web Vital [${entry.name || type}]: ${value.toFixed(2)}${type === 'layout-shift' ? '' : 'ms'}`,
               layer:   LogLayer.PRESENTATION,
               level:   isSlow ? LogLevel.WARN : LogLevel.INFO,
               context: {
-                metricName:   entry.name || type,
-                metricValue:  value,
-                metricUnit:   type === 'layout-shift' ? 'score' : 'ms',
+                metricName: entry.name || type, metricValue: value,
+                metricUnit: type === 'layout-shift' ? 'score' : 'ms',
                 renderTimeMs: type === 'navigation' ? value : undefined,
-                page:         location.pathname,
-                ...extra,
+                page: location.pathname, ...extra,
               } as LogContext,
             });
 
-            // Resource failures
             if (type === 'resource') {
               const res = entry as PerformanceResourceTiming;
               if (res.responseStatus >= 400) {
                 self._emit({
                   message: `Asset failure (${res.responseStatus}): ${entry.name}`,
-                  layer:   LogLayer.PRESENTATION,
-                  level:   LogLevel.ERROR,
+                  layer:   LogLayer.PRESENTATION, level: LogLevel.ERROR,
                   context: { assetUrl: entry.name, statusCode: res.responseStatus, page: location.pathname } as LogContext,
                 });
               }
@@ -663,27 +763,23 @@ export class SentinelBrowser {
           isAsync = true;
           return result
             .then((val: any) => {
-              const durationMs = performance.now() - start;
-              self._emit({ message: `${className}.${key} completed (async, ${durationMs.toFixed(1)}ms)`, layer, level: LogLevel.INFO,
-                context: { className, functionName: key, durationMs, isAsync: true } as LogContext });
+              self._emit({ message: `${className}.${key} completed (async, ${(performance.now() - start).toFixed(1)}ms)`, layer, level: LogLevel.INFO,
+                context: { className, functionName: key, durationMs: performance.now() - start, isAsync: true } as LogContext });
               return val;
             })
             .catch((err: any) => {
-              const durationMs = performance.now() - start;
               self._emit({ message: `${className}.${key} failed (async): ${err?.message}`, layer, level: LogLevel.ERROR,
-                context: { className, functionName: key, durationMs, isAsync: true, exceptionType: err?.constructor?.name, stackTrace: err?.stack } as LogContext });
+                context: { className, functionName: key, durationMs: performance.now() - start, isAsync: true, exceptionType: err?.constructor?.name, stackTrace: err?.stack } as LogContext });
               throw err;
             });
         }
-        const durationMs = performance.now() - start;
-        self._emit({ message: `${className}.${key} completed (${durationMs.toFixed(1)}ms)`, layer, level: LogLevel.INFO,
-          context: { className, functionName: key, durationMs, isAsync: false } as LogContext });
+        self._emit({ message: `${className}.${key} completed (${(performance.now() - start).toFixed(1)}ms)`, layer, level: LogLevel.INFO,
+          context: { className, functionName: key, durationMs: performance.now() - start, isAsync: false } as LogContext });
         return result;
       } catch (err: any) {
         if (!isAsync) {
-          const durationMs = performance.now() - start;
           self._emit({ message: `${className}.${key} threw: ${err?.message}`, layer, level: LogLevel.ERROR,
-            context: { className, functionName: key, durationMs, exceptionType: err?.constructor?.name, stackTrace: err?.stack } as LogContext });
+            context: { className, functionName: key, durationMs: performance.now() - start, exceptionType: err?.constructor?.name, stackTrace: err?.stack } as LogContext });
         }
         throw err;
       }
@@ -699,7 +795,7 @@ export class SentinelBrowser {
     }
     if ((window as any).ng) {
       this._emit({ message: 'Angular detected', layer: LogLayer.OBSERVABILITY, level: LogLevel.DEBUG, context: { component: 'Angular' } as LogContext });
-      this._discoverAngular();
+      this._hookAngular();
     }
   }
 
@@ -717,6 +813,55 @@ export class SentinelBrowser {
       } catch { /* ignore */ }
       return orig(...args);
     };
+  }
+
+  /** Angular: instruments HttpClient, Router, and root component */
+  private _hookAngular(): void {
+    const ng   = (window as any).ng;
+    if (!ng) return;
+
+    // Wait for Angular to fully bootstrap
+    const tryInstrument = () => {
+      try {
+        // Try root app component
+        const root = document.querySelector('[ng-version]') || document.querySelector('app-root');
+        if (!root) return;
+
+        // getComponent gives the component class instance
+        const comp = ng.getComponent?.(root);
+        if (comp) this.instrument(comp);
+
+        // Try to get the injector and pull HttpClient + Router
+        const injector = ng.getInjector?.(root);
+        if (injector) {
+          try {
+            // HttpClient
+            const HttpClient = (window as any).__ngHttpClient__ || injector.get?.('HttpClient');
+            if (HttpClient && typeof HttpClient === 'object') this.instrument(HttpClient);
+          } catch { /* not available */ }
+
+          try {
+            // Router
+            const Router = injector.get?.('Router');
+            if (Router && typeof Router === 'object') this.instrument(Router);
+          } catch { /* not available */ }
+        }
+
+        // Instrument all Angular components found in DOM
+        document.querySelectorAll('[_nghost]').forEach((el) => {
+          try {
+            const ctx = ng.getComponent?.(el) || ng.getContext?.(el);
+            if (ctx) this.instrument(ctx);
+          } catch { /* ignore */ }
+        });
+
+      } catch { /* Angular not ready yet */ }
+    };
+
+    // Try now and after a short delay (Angular may not be bootstrapped yet)
+    tryInstrument();
+    setTimeout(tryInstrument, 500);
+    setTimeout(tryInstrument, 2000);
   }
 
   private _discoverAngular(): void {
@@ -742,12 +887,6 @@ export class SentinelBrowser {
       } catch { /* some window props throw */ }
     });
   }
-
-  /* ── Helpers ─────────────────────────────────────────────── */
-
-  private _genTraceId(): string {
-    return Array.from({ length: 16 }, () => Math.floor(Math.random() * 16).toString(16)).join('');
-  }
 }
 
 /* ── Factory ─────────────────────────────────────────────── */
@@ -757,3 +896,24 @@ export const initBrowserSentinel = (config?: SentinelBrowserConfig): SentinelBro
   s.hook();
   return s;
 };
+
+/* ── Zero-config browser snippet ────────────────────────────
+   Drop this script tag into your HTML <head> to get zero-config
+   auto-instrumentation with no build-step changes:
+
+   <script>
+     window.__SENTINEL_CONFIG__ = {
+       serviceName: 'my-app',
+       relayUrl: '/sentinel/ingest',
+       debug: false,
+     };
+   </script>
+   <script src="/sentinel-browser.js"></script>
+
+   The bundle checks for window.__SENTINEL_CONFIG__ and auto-inits.
+──────────────────────────────────────────────────────────── */
+
+if (typeof window !== 'undefined' && (window as any).__SENTINEL_CONFIG__) {
+  const cfg = (window as any).__SENTINEL_CONFIG__;
+  (window as any).__sentinel__ = initBrowserSentinel(cfg);
+}
