@@ -1,16 +1,13 @@
 /* ============================================================
-   SENTINEL SDK — Core Types & LogRecord Schema  v2.1
-   Bug fixes from v2.0:
-     • CRITICAL: PII_PATTERNS /g regex flag caused stateful lastIndex
-       bug — every other call on same string would silently skip matches.
-       Fixed by using a factory function that creates fresh RegExp each call.
-     • maskContext: authorization key now redacted (was in Python but missing here)
-     • _gen8Hex / _gen16Hex: switched to crypto.getRandomValues for
-       cryptographically correct randomness (not Math.random)
-     • parseTraceparent: rejects malformed trace/span ids (wrong length)
-     • buildTraceparent: validates id lengths before building
-     • LogRecord constructor: host/version detection hardened
-     • to_dict: context serialised consistently (always object, never raw string)
+   SENTINEL SDK — Core Types & LogRecord Schema  v2.2
+   Changes from v2.1:
+     • Added sessionId, userId, activeUsers fields to relevant
+       context interfaces (stored inside the context JSON column —
+       no schema change required).
+     • ApiGatewayContext: sessionId already existed; added activeUsers.
+     • SecurityContext: added sessionId.
+     • ObservabilityContext: added activeUsers, sessionStart, sessionEnd.
+     • All other fixes from v2.1 preserved unchanged.
    ============================================================ */
 
 export enum LogLayer {
@@ -41,21 +38,17 @@ export interface W3CTraceContext {
   sampled:  boolean;
 }
 
-/** Parse W3C traceparent header: 00-<traceId>-<spanId>-<flags> */
 export function parseTraceparent(header: string): W3CTraceContext | null {
   if (!header || typeof header !== 'string') return null;
   const parts = header.split('-');
   if (parts.length !== 4 || parts[0] !== '00') return null;
   const [, traceId, spanId, flags] = parts;
-  // W3C spec: traceId = 32 hex, spanId = 16 hex
   if (!/^[0-9a-f]{32}$/.test(traceId)) return null;
   if (!/^[0-9a-f]{16}$/.test(spanId))  return null;
   return { traceId, spanId, sampled: flags === '01' };
 }
 
-/** Build W3C traceparent header from ids */
 export function buildTraceparent(traceId: string, spanId: string, sampled = true): string {
-  // Pad or truncate defensively so downstream never gets a malformed header
   const tid = traceId.padEnd(32, '0').slice(0, 32);
   const sid = spanId.padEnd(16, '0').slice(0, 16);
   return `00-${tid}-${sid}-${sampled ? '01' : '00'}`;
@@ -74,6 +67,10 @@ export interface PresentationContext {
   browserName?: string; browserVersion?: string; osName?: string;
   deviceType?: string; screenWidth?: number; screenHeight?: number;
   viewportWidth?: number; viewportHeight?: number; connectionType?: string;
+  /** Unique session identifier — set once per browser session */
+  sessionId?: string;
+  /** Authenticated user identifier */
+  userId?: string;
   [key: string]: any;
 }
 
@@ -88,6 +85,8 @@ export interface ApiGatewayContext {
   downstreamDurationMs?: number; thirdPartyLatencyMs?: number;
   retryCount?: number; authResult?: string; failureReason?: string;
   corsOrigin?: string;
+  /** Number of concurrent active sessions at the time of this request */
+  activeUsers?: number;
   [key: string]: any;
 }
 
@@ -100,6 +99,7 @@ export interface BusinessLogicContext {
   configKey?: string; configValue?: string; fileOperation?: string;
   filePath?: string; exceptionType?: string; stackTrace?: string;
   isAsync?: boolean; asyncDurationMs?: number;
+  sessionId?: string; userId?: string;
   [key: string]: any;
 }
 
@@ -114,6 +114,8 @@ export interface DataAccessContext {
   connectionWaitMs?: number;
   backupStatus?: string; transactionAction?: string; queryHash?: string;
   cacheHit?: boolean; cacheMiss?: boolean;
+  /** Propagated from the gateway request for exact span matching */
+  sessionId?: string; userId?: string;
   [key: string]: any;
 }
 
@@ -123,6 +125,7 @@ export interface DomainContext {
   policyName?: string; policyResult?: boolean | string; sagaId?: string;
   sagaStep?: string; sagaStatus?: string; riskScore?: number;
   fraudSignal?: string; auditUserId?: string; auditAction?: string;
+  sessionId?: string; userId?: string;
   [key: string]: any;
 }
 
@@ -132,6 +135,11 @@ export interface ObservabilityContext {
   metricUnit?: string; samplingDecision?: 'sampled' | 'dropped';
   samplingRate?: number; sloBurnRate?: number; sloName?: string;
   errorRatePercent?: number; anomalyType?: string; runbookUrl?: string;
+  /** Live concurrent-user metrics */
+  activeUsers?: number;
+  sessionStart?: string;
+  sessionEnd?: string;
+  sessionDurationMs?: number;
   [key: string]: any;
 }
 
@@ -142,6 +150,8 @@ export interface SecurityContext {
   complianceFramework?: string; complianceCheckPassed?: boolean;
   gdprDataSubject?: string; gdprLegalBasis?: string; path?: string;
   statusCode?: number; userAgent?: string;
+  /** Session identifier for this security event */
+  sessionId?: string;
   [key: string]: any;
 }
 
@@ -228,7 +238,6 @@ export class LogRecord {
       layer:      this.layer,
       level:      this.level,
       message:    this.message,
-      // Always serialise context as a JSON string for ClickHouse compatibility
       context:    typeof this.context === 'string'
                     ? this.context
                     : JSON.stringify(this.context ?? {}),
@@ -238,7 +247,7 @@ export class LogRecord {
   toString(): string {
     const colors: Record<LogLevel, string> = {
       [LogLevel.DEBUG]: '\x1b[36m', [LogLevel.INFO]: '\x1b[32m',
-      [LogLevel.WARN]: '\x1b[33m',  [LogLevel.ERROR]: '\x1b[31m',
+      [LogLevel.WARN]:  '\x1b[33m',  [LogLevel.ERROR]: '\x1b[31m',
       [LogLevel.FATAL]: '\x1b[35m',
     };
     const reset = '\x1b[0m';
@@ -252,7 +261,6 @@ export function _genUUID(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
     return crypto.randomUUID();
   }
-  // Fallback using getRandomValues (still crypto-safe)
   if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
     const buf = new Uint8Array(16);
     crypto.getRandomValues(buf);
@@ -261,14 +269,12 @@ export function _genUUID(): string {
     const hex = Array.from(buf).map((b) => b.toString(16).padStart(2, '0')).join('');
     return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`;
   }
-  // Last-resort Math.random (non-crypto, only if no crypto available)
   return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
     const r = Math.random() * 16 | 0;
     return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
   });
 }
 
-/** Generate 8 random bytes as 16 hex chars (W3C span_id). */
 export function _gen8Hex(): string {
   if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
     const buf = new Uint8Array(8);
@@ -280,7 +286,6 @@ export function _gen8Hex(): string {
   ).join('');
 }
 
-/** Generate 16 random bytes as 32 hex chars (W3C trace_id). */
 export function _gen16Hex(): string {
   if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
     const buf = new Uint8Array(16);
@@ -301,7 +306,6 @@ function _detectEnv(): string {
 
 function _detectHost(): string {
   if (typeof process !== 'undefined') {
-    // Allow runtime injection for container environments
     const injected = (globalThis as any).__sentinel_os_hostname__;
     if (injected) return injected;
     return process.env.HOSTNAME || process.env.HOST || 'unknown-host';
@@ -326,12 +330,6 @@ function _detectVersion(): string {
 }
 
 /* ── PII masking ─────────────────────────────────────────── */
-/*
- * CRITICAL FIX: Do NOT store compiled RegExp with /g flag in a shared array.
- * Stateful lastIndex on a shared regex causes every-other-call failures.
- * Instead we store pattern sources + flags and compile fresh each call via
- * a tiny factory. The overhead is negligible compared to the correctness gain.
- */
 
 interface PiiPattern {
   source:      string;
@@ -340,26 +338,17 @@ interface PiiPattern {
 }
 
 const _PII_PATTERN_DEFS: PiiPattern[] = [
-  // Credit / debit card numbers (13-16 digits, optional separators)
   { source: r`\b(?:\d[ -]?){13,16}\b`,                                                           flags: 'g',  replacement: '[CARD]' },
-  // JWT tokens (three base64url segments)
   { source: r`\b[A-Za-z0-9+/]{20,}\.[A-Za-z0-9+/]{20,}\.[A-Za-z0-9+/_-]{20,}\b`,              flags: 'g',  replacement: '[JWT]' },
-  // Bearer tokens
   { source: r`Bearer\s+[A-Za-z0-9\-._~+/]+=*`,                                                  flags: 'gi', replacement: 'Bearer [TOKEN]' },
-  // Email addresses
   { source: r`\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b`,                          flags: 'g',  replacement: '[EMAIL]' },
-  // Key=value patterns for secrets (password, token, key, etc.)
   { source: r`(password|passwd|pwd|secret|token|api_?key|auth)["'\s:=]+["']?[^\s"',;}{)\]]+["']?`, flags: 'gi', replacement: '$1=[REDACTED]' },
-  // US Social Security Numbers
   { source: r`\b\d{3}-\d{2}-\d{4}\b`,                                                           flags: 'g',  replacement: '[SSN]' },
-  // Phone numbers (US-centric but broad)
   { source: r`\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b`,                       flags: 'g',  replacement: '[PHONE]' },
 ];
 
-// Template tag to avoid TS treating backslashes as escape sequences
 function r(strings: TemplateStringsArray): string { return strings.raw[0]; }
 
-/** Mask PII/secrets in a string value. Creates fresh RegExp each call (no lastIndex bug). */
 export function maskPII(value: string): string {
   if (!value || typeof value !== 'string') return value;
   let out = value;
@@ -371,14 +360,12 @@ export function maskPII(value: string): string {
 
 const _REDACT_KEY_RE_SOURCE = r`password|passwd|pwd|secret|token|api_?key|auth|credential|private|authorization`;
 
-/** Recursively mask PII in an object (context dict). Creates fresh RegExp each call. */
 export function maskContext(obj: any, depth = 0): any {
   if (depth > 5) return obj;
   if (typeof obj === 'string') return maskPII(obj);
   if (obj === null || obj === undefined) return obj;
   if (typeof obj !== 'object') return obj;
 
-  // Handle arrays — recurse into each element
   if (Array.isArray(obj)) {
     return obj.map((v) => maskContext(v, depth + 1));
   }
