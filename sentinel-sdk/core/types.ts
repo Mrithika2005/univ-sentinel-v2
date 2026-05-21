@@ -204,7 +204,7 @@ export class LogRecord {
     this.message    = data.message;
     this.level      = data.level      || LogLevel.INFO;
     this.layer      = data.layer      || LogLayer.BUSINESS_LOGIC;
-    this.timestamp  = data.timestamp  || new Date().toISOString();
+    this.timestamp = data.timestamp || new Date().toLocaleString('en-CA', { timeZone: 'Asia/Kolkata', hour12: false }).replace(', ', 'T') + '+05:30';
     this.record_id  = data.record_id  || _genUUID();
     this.trace_id   = data.trace_id   || 'untracked';
     this.span_id    = data.span_id    || _gen8Hex();
