@@ -15,7 +15,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
    CONFIG — reads SENTINEL_HOST from env, defaults to LAN IP
 ───────────────────────────────────────────────────────────── */
 
-const SENTINEL_HOST = process.env.SENTINEL_HOST || '192.168.1.153';
+const SENTINEL_HOST = process.env.SENTINEL_HOST || '192.168.1.131';
 const SENTINEL_PORT = process.env.SENTINEL_PORT || '4318';
 const SENTINEL_URL  = `http://${SENTINEL_HOST}:${SENTINEL_PORT}/sentinel/ingest`;
 
